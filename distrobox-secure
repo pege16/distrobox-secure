@@ -45,16 +45,17 @@ init_dirs() {
 # FILESYSTEM PERMISSIONS:
 # home_folder:/path/to/folder     - Mount specific host directory
 # mount:/src/path:/dst/path       - Mount with custom destination
+# mount:/src:/dst:rw,z            - Opt-in SELinux shared relabel (changes host labels!)
 # 
 # NETWORK PERMISSIONS:
 # network:host                    - Enable host networking
 # network:bridge                  - Use bridge networking
 # 
-# DISPLAY PERMISSIONS:
+# DISPLAY PERMISSIONS (currently unsupported; secure creator rejects them):
 # x11:enable                      - Enable X11 forwarding
 # wayland:enable                  - Enable Wayland support
 # 
-# HARDWARE PERMISSIONS:
+# HARDWARE PERMISSIONS (currently unsupported; secure creator rejects them):
 # audio:enable                    - Enable audio passthrough
 # gpu:enable                      - Enable GPU access
 # usb:enable                      - Enable USB device access
@@ -69,14 +70,14 @@ init_dirs() {
 # unshare_all:false              - Disable all namespace isolation
 # 
 # SECURITY PERMISSIONS:
-# privileged:enable              - Run in privileged mode (NOT RECOMMENDED)
-# root:enable                    - Allow root access
-# init:enable                    - Enable init system
+# privileged:enable              - REJECTED by secure mode
+# root:enable                    - REJECTED by secure mode
+# init:enable                    - REJECTED by secure mode
 # hostname:custom_name           - Set custom hostname
 # 
-# ADDITIONAL CAPABILITIES:
-# cap_add:SYS_ADMIN              - Add specific capabilities
-# security_opt:seccomp=unconfined - Modify security options
+# ADDITIONAL CAPABILITIES (currently unsupported; secure creator rejects them):
+# cap_add:SYS_ADMIN              - REJECTED by secure mode
+# security_opt:seccomp=unconfined - REJECTED by secure mode
 # 
 # Examples:
 # mycontainer:home_folder:/home/user/Documents
@@ -673,13 +674,25 @@ grant_permission() {
         exit 1
     fi
 
+    # Reject options not supported by the strict container creator.
+    # Do not record a permission that would fail the next recreation.
+    case "$perm_type" in
+        "mount"|"home_folder"|"network") ;;
+        *) error "Permission '$perm_type' is not supported in secure mode"; return 1 ;;
+    esac
+
     # Validate path-based permissions
     case "$perm_type" in
         "home_folder"|"mount")
             if [[ "$perm_type" == "mount" ]]; then
                 local src_path
-                readarray -t mount_parts < <(parse_mount_permission "$perm_value") || exit 1
-                src_path="${mount_parts[0]}"
+                # A final :rw,z/:ro,z is an explicit SELinux opt-in.
+                local spec="$perm_value"
+                case "$spec" in
+                    *:ro|*:rw|*:ro,z|*:rw,z) spec="${spec%:*}" ;;
+                esac
+                [[ "$spec" == *:* ]] || { error "Invalid mount: $perm_value"; return 1; }
+                src_path="${spec%:*}"
                 validate_path "$src_path" || exit 1
             else
                 validate_path "$perm_value" || exit 1
