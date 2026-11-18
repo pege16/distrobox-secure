@@ -353,13 +353,54 @@ create_container() {
     # Combine all arguments
     local final_args=("${base_args[@]}")
 
-    # Add unshare and permission flags
-    for flag in "${all_flags[@]}"; do
-        if [[ "$flag" == --* ]]; then
-            final_args+=("$flag")
-        else
-            final_args+=("--additional-flags" "$flag")
-        fi
+    # Add unshare and permission flags.
+    #
+    # get_permissions emits a flat argv-style array, for example:
+    #   --unshare-netns
+    #   --volume
+    #   /home/user/Source:/home/user/Source:rw
+    #
+    # The old implementation treated every non-option token as a podman
+    # --additional-flags payload. That corrupts two-token distrobox options:
+    #   --volume --additional-flags /src:/dst:rw
+    #
+    # Keep native distrobox options and their arguments together. Only pass
+    # raw podman flags through --additional-flags.
+    local i=0
+    while [[ $i -lt ${#all_flags[@]} ]]; do
+        local flag="${all_flags[$i]}"
+
+        case "$flag" in
+            --volume|--env|--hostname|--cap-add|--security-opt|--device|--additional-flags)
+                if [[ $((i + 1)) -ge ${#all_flags[@]} ]]; then
+                    error "Missing value for $flag"
+                    exit 1
+                fi
+                final_args+=("$flag" "${all_flags[$((i + 1))]}")
+                i=$((i + 2))
+                ;;
+
+            --root|--init|--privileged)
+                final_args+=("$flag")
+                i=$((i + 1))
+                ;;
+
+            --unshare-netns|--unshare-devsys|--unshare-groups|--unshare-ipc|--unshare-process|--unshare-all)
+                final_args+=("$flag")
+                i=$((i + 1))
+                ;;
+
+            --*)
+                final_args+=("--additional-flags" "$flag")
+                i=$((i + 1))
+                ;;
+
+            *)
+                final_args+=("--additional-flags" "$flag")
+                i=$((i + 1))
+                ;;
+        esac
+
     done
 
     # Add security flags last (can be overridden by permissions)
