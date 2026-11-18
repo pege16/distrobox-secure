@@ -124,6 +124,30 @@ validate_path() {
     return 0
 }
 
+# Parse mount permissions as <src>:<dst>.
+#
+# Split on the last colon so host paths may still contain colons. Container
+# destination paths containing colons are not supported.
+parse_mount_permission() {
+    local mount_value="$1"
+    local src_path dst_path
+
+    if [[ "$mount_value" != *:* ]]; then
+        error "Invalid mount value: '$mount_value'. Expected format: <src>:<dst>"
+        return 1
+    fi
+
+    src_path="${mount_value%:*}"
+    dst_path="${mount_value##*:}"
+
+    if [[ -z "$src_path" ]] || [[ -z "$dst_path" ]]; then
+        error "Invalid mount value: '$mount_value'. Expected format: <src>:<dst>"
+        return 1
+    fi
+
+    printf '%s\n%s\n' "$src_path" "$dst_path"
+}
+
 # Create isolated home directory for container
 create_isolated_home() {
     local container_name="$1"
@@ -181,9 +205,10 @@ get_permissions() {
                         permissions+=("--volume" "${perm_value}:${perm_value}:rw")
                         ;;
                     "mount")
-                        # Parse mount as src:dst, handling paths with colons
-                        local src_path="${perm_value%%:*}"  # Everything before first colon
-                        local dst_path="${perm_value#*:}"   # Everything after first colon
+                        local src_path dst_path
+                        readarray -t mount_parts < <(parse_mount_permission "$perm_value") || return 1
+                        src_path="${mount_parts[0]}"
+                        dst_path="${mount_parts[1]}"
                         permissions+=("--volume" "${src_path}:${dst_path}:rw")
                         ;;
                     
@@ -458,9 +483,10 @@ grant_permission() {
     # Validate path-based permissions
     case "$perm_type" in
         "home_folder"|"mount")
-            # For mount, parse both source and destination paths
             if [[ "$perm_type" == "mount" ]]; then
-                local src_path="${perm_value%%:*}"
+                local src_path
+                readarray -t mount_parts < <(parse_mount_permission "$perm_value") || exit 1
+                src_path="${mount_parts[0]}"
                 validate_path "$src_path" || exit 1
             else
                 validate_path "$perm_value" || exit 1
