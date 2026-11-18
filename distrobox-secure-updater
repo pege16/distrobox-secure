@@ -1,0 +1,86 @@
+#!/bin/bash
+set -u
+set -o pipefail
+
+SELF="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE="${HOME}/.local/share/distrobox-secure"
+META="${BASE}/.metadata"
+PINNED="${HOME}/.config/distrobox-secure/pinned-containers"
+DISTROBOX_SECURE_BIN="${SCRIPT_DIR}/distrobox-secure"
+
+log() {
+  printf '%s %s: %s\n' "$(date '+%b %d %H:%M:%S')" "$SELF" "$*"
+}
+
+is_pinned() {
+  local name="$1"
+  [ -f "$PINNED" ] && awk -v name="$name" '
+    {
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 == name) {
+        found = 1
+      }
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' "$PINNED"
+}
+
+main() {
+  local failed=0
+  local count=0
+
+  if [ ! -d "$META" ]; then
+    log "metadata directory missing: $META"
+    exit 0
+  fi
+
+  for image_file in "$META"/*.image; do
+    [ -e "$image_file" ] || continue
+
+    local_name="$(basename "$image_file" .image)"
+    image="$(cat "$image_file")"
+
+    [ -n "$local_name" ] || continue
+    [ -n "$image" ] || {
+      log "skipping ${local_name}: empty image metadata"
+      continue
+    }
+
+    count=$((count + 1))
+
+    if is_pinned "$local_name"; then
+      log "skipping pinned container ${local_name}"
+      continue
+    fi
+
+    log "pulling image for ${local_name}: ${image}"
+    if ! podman pull "$image"; then
+      log "image pull failed for ${local_name}"
+      failed=1
+      continue
+    fi
+
+    log "recreating ${local_name}"
+    if ! "$DISTROBOX_SECURE_BIN" recreate "$local_name"; then
+      log "recreate failed for ${local_name}"
+      failed=1
+      continue
+    fi
+
+    log "updated ${local_name}"
+  done
+
+  if [ "$count" -eq 0 ]; then
+    log "no secure containers found in ${META}"
+  fi
+
+  exit "$failed"
+}
+
+if [[ "${DISTROBOX_SECURE_UPDATER_TEST:-0}" != "1" ]]; then
+  main "$@"
+fi

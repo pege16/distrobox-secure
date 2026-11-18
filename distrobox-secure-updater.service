@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull images and recreate non-pinned distrobox-secure containers
+Documentation=https://github.com/club-mate/distrobox-secure
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+ExecStart=%h/.local/bin/distrobox-secure-updater
