@@ -216,11 +216,11 @@ get_permissions() {
                     "network")
                         case "$perm_value" in
                             "host")
-                                permissions+=("--net" "host")
+                                permissions+=("--additional-flags" "--network=host")
                                 unshare_netns=false
                                 ;;
                             "bridge")
-                                permissions+=("--net" "bridge")
+                                permissions+=("--additional-flags" "--network=bridge")
                                 unshare_netns=false
                                 ;;
                         esac
