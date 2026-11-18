@@ -748,6 +748,22 @@ recreate_container() {
 
     log "Recreating container '$container_name' with current permissions"
 
+    # Validate the new specification BEFORE deleting the existing container.
+    # Prevents unsupported permissions / upstream CLI drift from destroying a working box.
+    local metadata_file="${DISTROBOX_BASE_DIR}/.metadata/${container_name}.image"
+    local image="docker.io/library/ubuntu:22.04"
+    [[ -f "$metadata_file" ]] && image=$(cat "$metadata_file")
+    local isolated_home="${DISTROBOX_BASE_DIR}/${container_name}-home"
+    if [[ ! -d "$isolated_home" ]]; then
+        error "Isolated home not found: $isolated_home"
+        return 1
+    fi
+    secure_distrobox_create "$container_name" "$image" "$isolated_home" check || return 1
+    if ! podman image exists "$image"; then
+        error "Image is no longer available locally: $image"
+        return 1
+    fi
+
     # Stop and remove an existing container.
     # Do not parse distrobox list output; use the container runtime directly
     # to determine whether the container actually exists.
@@ -767,13 +783,20 @@ recreate_container() {
         fi
     fi
 
-    # Get image from metadata or use default
+    # Use the same validated image when creating the replacement.
+    create_container "$container_name" "$image"
+}
+
+# Validate planned secure container creation without changing an existing container.
+check_container() {
+    local container_name="$1"
+    validate_container_name "$container_name" || return 1
+    local isolated_home="${DISTROBOX_BASE_DIR}/${container_name}-home"
+    [[ -d "$isolated_home" ]] || { error "Isolated home not found: $isolated_home"; return 1; }
     local metadata_file="${DISTROBOX_BASE_DIR}/.metadata/${container_name}.image"
     local image="docker.io/library/ubuntu:22.04"
-    if [[ -f "$metadata_file" ]]; then
-        image=$(cat "$metadata_file")
-    fi
-    create_container "$container_name" "$image"
+    [[ -f "$metadata_file" ]] && image=$(cat "$metadata_file")
+    secure_distrobox_create "$container_name" "$image" "$isolated_home" check
 }
 
 # Show usage
@@ -887,6 +910,13 @@ main() {
                 exit 1
             fi
             recreate_container "$2"
+            ;;
+        "check")
+            if [[ $# -lt 2 ]]; then
+                error "Container name required"
+                exit 1
+            fi
+            check_container "$2"
             ;;
         "edit")
             "${EDITOR:-nano}" "$PERMISSIONS_FILE"
