@@ -544,10 +544,23 @@ recreate_container() {
 
     log "Recreating container '$container_name' with current permissions"
 
-    # Stop and remove existing container
-    if distrobox list | grep -q "^$container_name"; then
+    # Stop and remove an existing container.
+    # Do not parse distrobox list output; use the container runtime directly
+    # to determine whether the container actually exists.
+    if podman container exists "$container_name"; then
         distrobox stop "$container_name" 2>/dev/null || true
-        distrobox rm "$container_name" --force 2>/dev/null || true
+        distrobox rm --force "$container_name" 2>/dev/null || true
+
+        # Safety fallback if distrobox failed to remove the underlying container.
+        if podman container exists "$container_name"; then
+            podman rm --force "$container_name"
+        fi
+
+        # Never continue into create while an old container still exists.
+        if podman container exists "$container_name"; then
+            error "Failed to remove existing container '$container_name'"
+            exit 1
+        fi
     fi
 
     # Get image from metadata or use default
