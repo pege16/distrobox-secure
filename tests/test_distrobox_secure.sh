@@ -8,9 +8,13 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DISTROBOX_SECURE_TEST=1
+export DISTROBOX_SECURE_UPDATER_TEST=1
+COMPLETION_SCRIPT="$SCRIPT_DIR/completions/distrobox-secure.bash"
+UPDATER_SCRIPT="$SCRIPT_DIR/distrobox-secure-updater"
 
 # Source the main script
 source "$SCRIPT_DIR/distrobox-secure" >/dev/null 2>&1
+source "$UPDATER_SCRIPT" >/dev/null 2>&1
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -39,6 +43,11 @@ test_fail() {
 
 # Mock distrobox
 distrobox() {
+    if [[ "${1:-}" == "list" ]]; then
+        printf "NAME IMAGE STATUS\n"
+        printf "alpha docker.io/library/ubuntu:22.04 Running\n"
+        printf "beta docker.io/library/fedora:39 Exited\n"
+    fi
     return 0
 }
 
@@ -82,9 +91,10 @@ fi
 # ==============================================================================
 test_start "Mount path parsing"
 test_perm_value="/src/path:with:colons:/dst/path"
-src_path="${test_perm_value%%:*}"
-dst_path="${test_perm_value#*:}"
-if [[ "$src_path" == "/src/path" ]] && [[ "$dst_path" == "with:colons:/dst/path" ]]; then
+readarray -t mount_parts < <(parse_mount_permission "$test_perm_value")
+src_path="${mount_parts[0]}"
+dst_path="${mount_parts[1]}"
+if [[ "$src_path" == "/src/path:with:colons" ]] && [[ "$dst_path" == "/dst/path" ]]; then
     test_pass
 else
     test_fail
@@ -95,6 +105,83 @@ fi
 # ==============================================================================
 test_start "Bash syntax"
 result=$(bash -n "$SCRIPT_DIR/distrobox-secure" >/dev/null 2>&1; echo $?)
+if [[ "$result" == "0" ]]; then
+    test_pass
+else
+    test_fail
+fi
+
+# ==============================================================================
+# Test 6
+# ==============================================================================
+test_start "Invalid mount path parsing"
+result=$(parse_mount_permission "/src-only" >/dev/null 2>&1; echo $?)
+if [[ "$result" != "0" ]]; then
+    test_pass
+else
+    test_fail
+fi
+
+# ==============================================================================
+# Test 7
+# ==============================================================================
+test_start "Pinned container matching is exact"
+test_home=$(mktemp -d)
+mkdir -p "$test_home/.config/distrobox-secure"
+PINNED="$test_home/.config/distrobox-secure/pinned-containers"
+printf 'foo.bar\n' > "$PINNED"
+if is_pinned "foo.bar" && ! is_pinned "fooXbar"; then
+    test_pass
+else
+    test_fail
+fi
+rm -rf "$test_home"
+
+# ==============================================================================
+# Test 8
+# ==============================================================================
+test_start "Bash completion suggests commands"
+source "$COMPLETION_SCRIPT"
+COMP_WORDS=(distrobox-secure gr)
+COMP_CWORD=1
+_distrobox_secure_completions
+if [[ " ${COMPREPLY[*]} " == *" grant "* ]]; then
+    test_pass
+else
+    test_fail
+fi
+
+# ==============================================================================
+# Test 9
+# ==============================================================================
+test_start "Bash completion suggests containers for grant"
+COMP_WORDS=(distrobox-secure grant a)
+COMP_CWORD=2
+_distrobox_secure_completions
+if [[ " ${COMPREPLY[*]} " == *" alpha "* ]]; then
+    test_pass
+else
+    test_fail
+fi
+
+# ==============================================================================
+# Test 10
+# ==============================================================================
+test_start "Bash completion suggests permission types"
+COMP_WORDS=(distrobox-secure grant alpha ne)
+COMP_CWORD=3
+_distrobox_secure_completions
+if [[ " ${COMPREPLY[*]} " == *" network "* ]]; then
+    test_pass
+else
+    test_fail
+fi
+
+# ==============================================================================
+# Test 11
+# ==============================================================================
+test_start "Updater script syntax"
+result=$(bash -n "$UPDATER_SCRIPT" >/dev/null 2>&1; echo $?)
 if [[ "$result" == "0" ]]; then
     test_pass
 else
