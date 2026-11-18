@@ -251,7 +251,9 @@ get_permissions() {
                     "gpu")
                         if [[ "$perm_value" == "enable" ]]; then
                             permissions+=("--device" "/dev/dri")
-                            permissions+=("--device" "/dev/nvidia0" "/dev/nvidiactl" "/dev/nvidia-uvm")
+                            [[ -e /dev/nvidia0 ]] && permissions+=("--device" "/dev/nvidia0")
+                            [[ -e /dev/nvidiactl ]] && permissions+=("--device" "/dev/nvidiactl")
+                            [[ -e /dev/nvidia-uvm ]] && permissions+=("--device" "/dev/nvidia-uvm")
                         fi
                         ;;
                     "usb")
