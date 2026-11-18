@@ -91,7 +91,7 @@ EOF
 
 # Check dependencies
 check_deps() {
-    local deps=("distrobox" "podman")
+    local deps=("distrobox" "podman" "python3")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             error "$dep is not installed"
@@ -339,6 +339,274 @@ get_permissions() {
     
     # Output all flags
     printf '%s\n' "${unshare_flags[@]}" "${permissions[@]}"
+}
+
+# Strict Distrobox-compatible creator. We use upstream Distrobox --dry-run to obtain
+# its entrypoint and init arguments, but NEVER execute its generated Podman command.
+# In particular, upstream sets --privileged, label=disable and broad host mounts.
+# The Python allowlist instead constructs a new rootless podman create command.
+# A future incompatible Distrobox CLI fails closed rather than falling back.
+secure_distrobox_create() {
+    local container_name="$1" image="$2" isolated_home="$3" action="${4:-create}"
+    python3 - "$container_name" "$image" "$isolated_home" "$PERMISSIONS_FILE" \
+        "$DISTROBOX_BASE_DIR" "$action" <<'SECURE_PY'
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+name, image, isolated, conf, base, action = sys.argv[1:]
+home = pathlib.Path.home().resolve()
+isolated_path = pathlib.Path(isolated).resolve()
+
+
+def fail(message):
+    print(f"[ERROR] secure create: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def within(path, parent):
+    return path == parent or parent in path.parents
+
+
+if os.geteuid() == 0:
+    fail("rootful execution is not supported; use rootless Podman")
+if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+    fail("invalid container name")
+if not re.fullmatch(r"[A-Za-z0-9_./:@-]+", image):
+    fail("invalid container image reference")
+if not isolated_path.is_dir() or not within(isolated_path, home):
+    fail("isolated home must be an existing directory below the host HOME")
+if action not in ("create", "check"):
+    fail("invalid action")
+
+# Explicit filesystem grants. No automatic /, $HOME, /run/host or runtime socket mounts.
+mounts = []
+network = "none"
+for lineno, raw in enumerate(pathlib.Path(conf).read_text().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split(":", 2)
+    if len(parts) != 3 or parts[0] != name:
+        continue
+    _, kind, value = parts
+    if kind == "network":
+        if value not in ("host", "bridge"):
+            fail(f"line {lineno}: unsupported network grant {value!r}")
+        network = value
+        continue
+    if kind.startswith("unshare_"):
+        if value != "true":
+            fail(f"line {lineno}: disabling namespace isolation is not supported in secure mode")
+        continue
+    if kind not in ("mount", "home_folder"):
+        fail(f"line {lineno}: grant {kind!r} is not supported in secure mode; refusing unsafe fallback")
+
+    mode = "rw"
+    if kind == "home_folder":
+        source, target = value, value
+    else:
+        # Existing syntax: mount:<source>:<target>
+        # Optional explicit SELinux shared relabel: mount:<source>:<target>:rw,z
+        v = value.rsplit(":", 1)
+        if len(v) == 2 and v[1] in ("ro", "rw", "ro,z", "rw,z"):
+            value, mode = v
+        if ":" not in value:
+            fail(f"line {lineno}: expected mount:<source>:<target>[:ro|rw|ro,z|rw,z]")
+        source, target = value.rsplit(":", 1)
+
+    if not source.startswith("/") or not target.startswith("/") or "\x00" in source + target:
+        fail(f"line {lineno}: source and destination must be absolute")
+    src_path = pathlib.Path(source).resolve()
+    target_path = pathlib.PurePosixPath(os.path.normpath(target))
+    if not src_path.exists():
+        fail(f"line {lineno}: source does not exist: {source}")
+    if src_path == pathlib.Path("/") or src_path == home or within(home, src_path):
+        fail(f"line {lineno}: broad host mount forbidden: {source}")
+    if within(src_path, isolated_path):
+        fail(f"line {lineno}: do not expose managed isolated-home contents as a new grant")
+    if any(str(target_path) == p or str(target_path).startswith(p + "/") for p in
+           ("/run/host", "/run/user", "/proc", "/sys", "/dev")):
+        fail(f"line {lineno}: forbidden container destination: {target}")
+    if str(target_path) == str(isolated_path) or str(target_path) == str(home):
+        fail(f"line {lineno}: destination would replace container home: {target}")
+    # No mount may replace an ancestor of the isolated home: it would shadow mounts.
+    if within(isolated_path, pathlib.Path(str(target_path))):
+        fail(f"line {lineno}: destination overlaps a parent of isolated home")
+    if target_path in [pathlib.PurePosixPath("/usr"), pathlib.PurePosixPath("/etc")]:
+        fail(f"line {lineno}: forbidden broad container destination")
+    mounts.append((str(src_path), str(target_path), mode))
+
+# Reject overlapping target mounts: last-wins would silently mask an earlier grant.
+targets = [pathlib.PurePosixPath(m[1]) for m in mounts]
+for i, a in enumerate(targets):
+    for b in targets[i + 1:]:
+        if a == b or a in b.parents or b in a.parents:
+            fail(f"overlapping mount destinations: {a} and {b}")
+
+# Distrobox generates its current init invocation and associated metadata.
+# Parsing shlex without shell evaluation is intentional; don't execute dry-run text.
+cmd = ["distrobox", "create", "--dry-run", "--no-entry", "--name", name,
+       "--image", image, "--home", str(isolated_path), "--unshare-netns",
+       "--unshare-process", "--unshare-ipc", "--unshare-groups",
+       "--unshare-devsys"]
+try:
+    output = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE)
+except subprocess.CalledProcessError as err:
+    fail(f"distrobox --dry-run failed: {err.stderr.strip()}")
+try:
+    words = shlex.split(output)
+except ValueError as err:
+    fail(f"invalid distrobox dry-run output: {err}")
+if words[:2] != ["podman", "create"]:
+    fail("unsupported Distrobox dry-run prefix (expected 'podman create')")
+try:
+    at = words.index("--entrypoint")
+except ValueError:
+    fail("Distrobox dry-run has no entrypoint")
+if at + 2 >= len(words) or words[at + 1] != "/usr/bin/entrypoint" or words[at + 2] != image:
+    fail("unexpected Distrobox entrypoint/image format")
+prefix, init_args = words[2:at], words[at + 3:]
+if not init_args or init_args[:1] != ["--verbose"] or "--home" not in init_args:
+    fail("unsupported Distrobox init invocation")
+if init_args[init_args.index("--home") + 1] != str(isolated_path):
+    fail("Distrobox init HOME doesn't match isolated HOME")
+
+# Only harvest a trusted Distrobox entrypoint script and expected metadata.
+entrypoint = None
+export_tool = None
+labels = []
+envs = {}
+i = 0
+while i < len(prefix):
+    key = prefix[i]
+    if key in ("--volume", "-v", "--label", "--env"):
+        if i + 1 >= len(prefix):
+            fail(f"malformed Distrobox {key} option")
+        value = prefix[i + 1]
+        if key in ("--volume", "-v"):
+            v = value.split(":")
+            if len(v) >= 3 and v[1] == "/usr/bin/entrypoint":
+                entrypoint = v[0]
+            elif len(v) >= 3 and v[1] == "/usr/bin/distrobox-export":
+                export_tool = v[0]
+        elif key == "--label" and value in ("manager=distrobox", "distrobox.unshare_groups=1"):
+            labels.append(value)
+        elif key == "--env" and "=" in value:
+            k, v = value.split("=", 1)
+            if k in ("SHELL", "HOME", "CONTAINER_ID", "container", "DISTROBOX_HOST_HOME"):
+                envs[k] = v
+        i += 2
+        continue
+    # Never inherit privileged status, host filesystem mounts, label=disable,
+    # host namespaces, host devices or unbounded resource settings.
+    i += 1
+if not entrypoint or "manager=distrobox" not in labels:
+    fail("Distrobox entrypoint or manager label missing")
+if envs.get("HOME") != str(isolated_path) or envs.get("CONTAINER_ID") != name:
+    fail("Distrobox HOME / CONTAINER_ID mismatch")
+for tool in (entrypoint, export_tool):
+    if tool and (not pathlib.Path(tool).is_file()):
+        fail(f"Distrobox helper unavailable: {tool}")
+
+# Copy integration scripts to a private managed directory. SELinux :Z must NEVER
+# relabel distrobox's /usr/bin files on the host.
+runtime = pathlib.Path(base) / ".runtime" / name
+if action == "create":
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime.chmod(0o700)
+    for origin, dest in ((entrypoint, "distrobox-init"),
+                         (export_tool, "distrobox-export")):
+        if origin:
+            shutil.copy2(origin, runtime / dest)
+            (runtime / dest).chmod(0o755)
+
+args = ["podman", "create", "--name", name,
+        "--hostname", name, "--user", "root:root", "--userns=keep-id",
+        "--network=" + network, "--ipc=private", "--pid=private",
+        "--pids-limit=512", "--cap-drop=all", "--security-opt=no-new-privileges",
+        "--tmpfs=/tmp:rw,nosuid,nodev,size=512m"]
+# Distobox-init must initially run as container-root to create the user.
+# Restrict the ambient capability set to its basic account/package setup needs.
+for cap in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "SETFCAP"):
+    args.append("--cap-add=" + cap)
+for label in labels:
+    args += ["--label", label]
+for k, v in envs.items():
+    args += ["--env", f"{k}={v}"]
+args += ["--env", f"XDG_CONFIG_HOME={isolated_path}/.config",
+         "--env", f"XDG_DATA_HOME={isolated_path}/.local/share",
+         "--env", f"XDG_CACHE_HOME={isolated_path}/.cache",
+         "--env", f"XDG_STATE_HOME={isolated_path}/.local/state"]
+# The isolated home belongs to distrobox-secure; only this managed source may be
+# relabeled automatically. Explicit user grants are NOT relabeled by default.
+args += ["--volume", f"{isolated_path}:{isolated_path}:rw,Z"]
+args += ["--volume", f"{runtime / 'distrobox-init'}:/usr/bin/entrypoint:ro,Z"]
+if export_tool:
+    args += ["--volume", f"{runtime / 'distrobox-export'}:/usr/bin/distrobox-export:ro,Z"]
+# Marker for distrobox-init's rootless mode detection.
+args += ["--volume", "/dev/null:/run/.distrobox.rootless:ro"]
+for src, target, mode in mounts:
+    args += ["--volume", f"{src}:{target}:{mode}"]
+args += ["--entrypoint", "/usr/bin/entrypoint", image] + init_args
+
+if action == "check":
+    print("[OK] secure Podman command generated and validated (not executed)")
+    print("  image:", image)
+    print("  network:", network)
+    print("  mounts:")
+    print("    managed isolated home (rw,Z):", isolated_path)
+    for src, dst, mode in mounts:
+        print(f"    {src} -> {dst} ({mode})")
+    print("  No --privileged, no host rootfs/home, no host runtime directory")
+    raise SystemExit(0)
+if subprocess.call(["podman", "image", "exists", image]) != 0:
+    fail(f"image not available locally: {image}; build/pull it first")
+try:
+    subprocess.run(args, check=True)
+except subprocess.CalledProcessError as err:
+    fail(f"podman create failed (exit {err.returncode})")
+
+# Audit the realized OCI config. Stop and remove any unexpected container.
+inspect = subprocess.check_output(["podman", "inspect", name,
+    "--format", "{{json .}}"], text=True)
+import json
+info = json.loads(inspect)
+mounts_real = info.get("Mounts") or []
+expected = {(str(isolated_path), str(isolated_path)),
+            (str(runtime / "distrobox-init"), "/usr/bin/entrypoint"),
+            ("/dev/null", "/run/.distrobox.rootless")}
+if export_tool:
+    expected.add((str(runtime / "distrobox-export"), "/usr/bin/distrobox-export"))
+expected |= {(src, dst) for src, dst, _ in mounts}
+real = {(str(pathlib.Path(m.get("Source", "")).resolve()), m.get("Destination"))
+        for m in mounts_real if m.get("Type") == "bind"}
+expected = {(str(pathlib.Path(src).resolve()), dst) for src, dst in expected}
+# A Podman-created tmpfs or runtime-internal anonymous volume is not a host bind.
+config = info.get("HostConfig") or {}
+caps_dropped = [str(v).upper() for v in (config.get("CapDrop") or [])]
+unsafe = (config.get("Privileged") or
+          any(str(x).startswith("label=disable") for x in (config.get("SecurityOpt") or [])) or
+          not any(str(x).startswith("no-new-privileges") for x in (config.get("SecurityOpt") or [])) or
+          "ALL" not in caps_dropped or
+          any(dst == "/run/host" or dst.startswith("/run/host/") for _, dst in real) or
+          any(src == "/" for src, _ in real) or
+          any(src == str(home) and dst == str(home) for src, dst in real) or
+          any(dst == "/run/user" or dst.startswith("/run/user/") for _, dst in real) or
+          real != expected)
+# On an enforcing SELinux host a secure sandbox must retain its process label.
+selinux_enforce = pathlib.Path("/sys/fs/selinux/enforce")
+if selinux_enforce.is_file() and selinux_enforce.read_text().strip() == "1":
+    unsafe = unsafe or not info.get("ProcessLabel")
+if unsafe:
+    subprocess.run(["podman", "rm", "--force", name], check=False)
+    fail(f"unsafe realized Podman configuration; removed container. missing={expected - real}, extra={real - expected}, capdrop={caps_dropped}")
+print("[OK] Secure OCI audit passed. Run distrobox enter to test init.")
+SECURE_PY
 }
 
 # Create hardened container
