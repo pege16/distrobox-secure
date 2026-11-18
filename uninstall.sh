@@ -28,6 +28,7 @@ error() {
 BIN_DIR="${HOME}/.local/bin"
 COMPLETION_DIR="${HOME}/.local/share/bash-completion/completions"
 COMPLETION_DIR_ZSH="${HOME}/.zsh/completions"
+SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
 log "Distrobox Secure Uninstaller"
 log "============================="
@@ -49,6 +50,12 @@ if [[ -f "$BIN_DIR/distrobox-secure" ]]; then
     rm "$BIN_DIR/distrobox-secure"
 fi
 
+# Remove updater executable
+if [[ -f "$BIN_DIR/distrobox-secure-updater" ]]; then
+    log "Removing updater executable from $BIN_DIR..."
+    rm "$BIN_DIR/distrobox-secure-updater"
+fi
+
 # Remove bash completion
 if [[ -f "$COMPLETION_DIR/distrobox-secure" ]]; then
     log "Removing bash completion..."
@@ -59,6 +66,17 @@ fi
 if [[ -f "$COMPLETION_DIR_ZSH/_distrobox-secure" ]]; then
     log "Removing zsh completion..."
     rm "$COMPLETION_DIR_ZSH/_distrobox-secure"
+fi
+
+# Remove systemd user units
+if [[ -f "$SYSTEMD_USER_DIR/distrobox-secure-updater.service" ]]; then
+    log "Removing updater service unit..."
+    rm "$SYSTEMD_USER_DIR/distrobox-secure-updater.service"
+fi
+
+if [[ -f "$SYSTEMD_USER_DIR/distrobox-secure-updater.timer" ]]; then
+    log "Removing updater timer unit..."
+    rm "$SYSTEMD_USER_DIR/distrobox-secure-updater.timer"
 fi
 
 echo ""

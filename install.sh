@@ -32,6 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 COMPLETION_DIR="${HOME}/.local/share/bash-completion/completions"
 COMPLETION_DIR_ZSH="${HOME}/.zsh/completions"
+SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
 log "Distrobox Secure Installer"
 log "=========================="
@@ -52,11 +53,19 @@ done
 mkdir -p "$BIN_DIR"
 mkdir -p "$COMPLETION_DIR"
 mkdir -p "$COMPLETION_DIR_ZSH"
+mkdir -p "$SYSTEMD_USER_DIR"
 
 # Copy executable
 log "Installing distrobox-secure to $BIN_DIR..."
 cp "${SCRIPT_DIR}/distrobox-secure" "$BIN_DIR/distrobox-secure"
 chmod +x "$BIN_DIR/distrobox-secure"
+
+# Copy updater executable if it exists
+if [[ -f "${SCRIPT_DIR}/distrobox-secure-updater" ]]; then
+    log "Installing distrobox-secure-updater to $BIN_DIR..."
+    cp "${SCRIPT_DIR}/distrobox-secure-updater" "$BIN_DIR/distrobox-secure-updater"
+    chmod +x "$BIN_DIR/distrobox-secure-updater"
+fi
 
 # Copy bash completion if it exists
 if [[ -f "${SCRIPT_DIR}/completions/distrobox-secure.bash" ]]; then
@@ -68,6 +77,17 @@ fi
 if [[ -f "${SCRIPT_DIR}/completions/_distrobox-secure" ]]; then
     log "Installing zsh completion..."
     cp "${SCRIPT_DIR}/completions/_distrobox-secure" "$COMPLETION_DIR_ZSH/_distrobox-secure"
+fi
+
+# Copy systemd user units if they exist
+if [[ -f "${SCRIPT_DIR}/distrobox-secure-updater.service" ]]; then
+    log "Installing updater service unit..."
+    cp "${SCRIPT_DIR}/distrobox-secure-updater.service" "$SYSTEMD_USER_DIR/distrobox-secure-updater.service"
+fi
+
+if [[ -f "${SCRIPT_DIR}/distrobox-secure-updater.timer" ]]; then
+    log "Installing updater timer unit..."
+    cp "${SCRIPT_DIR}/distrobox-secure-updater.timer" "$SYSTEMD_USER_DIR/distrobox-secure-updater.timer"
 fi
 
 # Check if ~/.local/bin is in PATH
@@ -86,5 +106,6 @@ echo ""
 echo -e "${BLUE}Next steps:${NC}"
 echo "1. If not already in PATH, add ~/.local/bin to your PATH"
 echo "2. Run 'distrobox-secure create <container-name>' to get started"
-echo "3. Read the README.md for detailed documentation"
+echo "3. To enable auto-updates, run: systemctl --user enable --now distrobox-secure-updater.timer"
+echo "4. Read the README.md for detailed documentation"
 echo ""
