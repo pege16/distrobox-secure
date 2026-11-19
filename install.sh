@@ -40,10 +40,10 @@ echo ""
 
 # Check dependencies
 log "Checking dependencies..."
-for dep in distrobox podman; do
+for dep in podman python3; do
     if ! command -v "$dep" &> /dev/null; then
         error "$dep is not installed. Please install it first:"
-        echo "  Visit: https://github.com/89luca89/distrobox"
+        echo "  Install a supported rootless Podman and Python 3 runtime"
         exit 1
     fi
     log "✓ $dep found"
@@ -59,6 +59,9 @@ mkdir -p "$SYSTEMD_USER_DIR"
 log "Installing distrobox-secure to $BIN_DIR..."
 cp "${SCRIPT_DIR}/distrobox-secure" "$BIN_DIR/distrobox-secure"
 chmod +x "$BIN_DIR/distrobox-secure"
+
+# Standalone secure OCI backend is required for create/check/enter.
+install -m 755 "${SCRIPT_DIR}/distrobox-secure-runtime.py" "$BIN_DIR/distrobox-secure-runtime.py"
 
 # Copy updater executable if it exists
 if [[ -f "${SCRIPT_DIR}/distrobox-secure-updater" ]]; then

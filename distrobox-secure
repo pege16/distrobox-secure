@@ -11,6 +11,7 @@ SCRIPT_NAME="$(basename "$0")"
 DISTROBOX_BASE_DIR="${HOME}/.local/share/distrobox-secure"
 CONFIG_DIR="${HOME}/.config/distrobox-secure"
 PERMISSIONS_FILE="${CONFIG_DIR}/permissions.conf"
+RUNTIME_BACKEND="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/distrobox-secure-runtime.py"
 
 # Colors for output
 RED='\033[0;31m'
@@ -93,7 +94,7 @@ EOF
 
 # Check dependencies
 check_deps() {
-    local deps=("distrobox" "podman" "python3")
+    local deps=("podman" "python3")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             error "$dep is not installed"
@@ -590,11 +591,19 @@ real = {(str(pathlib.Path(m.get("Source", "")).resolve()), m.get("Destination"))
 expected = {(str(pathlib.Path(src).resolve()), dst) for src, dst in expected}
 # A Podman-created tmpfs or runtime-internal anonymous volume is not a host bind.
 config = info.get("HostConfig") or {}
-caps_dropped = [str(v).upper() for v in (config.get("CapDrop") or [])]
+# Podman may render CapDrop as the complement of the final capability set,
+# rather than the literal CLI argument "all". Audit the realized sets instead.
+allowed_caps = {
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER",
+    "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP",
+}
+effective_caps = {str(cap).upper() for cap in (info.get("EffectiveCaps") or [])}
+bounding_caps = {str(cap).upper() for cap in (info.get("BoundingCaps") or [])}
+capabilities_safe = effective_caps == allowed_caps and bounding_caps == allowed_caps
 unsafe = (config.get("Privileged") or
           any(str(x).startswith("label=disable") for x in (config.get("SecurityOpt") or [])) or
           not any(str(x).startswith("no-new-privileges") for x in (config.get("SecurityOpt") or [])) or
-          "ALL" not in caps_dropped or
+          not capabilities_safe or
           any(dst == "/run/host" or dst.startswith("/run/host/") for _, dst in real) or
           any(src == "/" for src, _ in real) or
           any(src == str(home) and dst == str(home) for src, dst in real) or
@@ -606,7 +615,7 @@ if selinux_enforce.is_file() and selinux_enforce.read_text().strip() == "1":
     unsafe = unsafe or not info.get("ProcessLabel")
 if unsafe:
     subprocess.run(["podman", "rm", "--force", name], check=False)
-    fail(f"unsafe realized Podman configuration; removed container. missing={expected - real}, extra={real - expected}, capdrop={caps_dropped}")
+    fail(f"unsafe realized Podman configuration; removed container. missing={expected - real}, extra={real - expected}, effective={sorted(effective_caps)}, bounding={sorted(bounding_caps)}")
 print("[OK] Secure OCI audit passed. Run distrobox enter to test init.")
 SECURE_PY
 }
@@ -628,11 +637,11 @@ create_container() {
     local isolated_home
     isolated_home=$(create_isolated_home "$container_name")
 
-    # The Distrobox --dry-run is parsed into an allowlisted Podman create invocation.
-    # The upstream arguments are deliberately NOT executed as generated.
+    # The standalone backend does not run distrobox-init or mount host internals.
+    [[ -f "$RUNTIME_BACKEND" ]] || { error "Missing runtime backend: $RUNTIME_BACKEND"; return 1; }
 
     # Create the container
-    if secure_distrobox_create "$container_name" "$image" "$isolated_home" create; then
+    if python3 "$RUNTIME_BACKEND" create "$container_name" "$image" "$isolated_home"; then
         log "Container '$container_name' created successfully"
         log "Isolated home: $isolated_home"
 
@@ -643,7 +652,7 @@ create_container() {
 
         log "Secure creation validated; host grants were verified individually"
 
-        log "To enter the container: distrobox enter $container_name"
+        log "To enter the container: distrobox-secure enter $container_name"
     else
         error "Failed to create container '$container_name'"
         exit 1
@@ -758,10 +767,15 @@ recreate_container() {
         error "Isolated home not found: $isolated_home"
         return 1
     fi
-    secure_distrobox_create "$container_name" "$image" "$isolated_home" check || return 1
+    python3 "$RUNTIME_BACKEND" check "$container_name" "$image" "$isolated_home" || return 1
     if ! podman image exists "$image"; then
         error "Image is no longer available locally: $image"
         return 1
+    fi
+
+    # Old Distrobox containers must not be silently replaced: preserve their data.
+    if podman container exists "$container_name"; then
+        python3 "$RUNTIME_BACKEND" managed "$container_name" || return 1
     fi
 
     # Stop and remove an existing container.
@@ -796,7 +810,16 @@ check_container() {
     local metadata_file="${DISTROBOX_BASE_DIR}/.metadata/${container_name}.image"
     local image="docker.io/library/ubuntu:22.04"
     [[ -f "$metadata_file" ]] && image=$(cat "$metadata_file")
-    secure_distrobox_create "$container_name" "$image" "$isolated_home" check
+    python3 "$RUNTIME_BACKEND" check "$container_name" "$image" "$isolated_home"
+}
+
+# Run a shell or command in a managed standalone secure container.
+enter_container() {
+    local container_name="$1"
+    shift
+    validate_container_name "$container_name" || return 1
+    [[ -f "$RUNTIME_BACKEND" ]] || { error "Missing runtime backend: $RUNTIME_BACKEND"; return 1; }
+    python3 "$RUNTIME_BACKEND" enter "$container_name" -- "$@"
 }
 
 # Show usage
@@ -810,8 +833,18 @@ Commands:
   revoke <name> <type>      Revoke permission from container
   list <name>               List permissions for container
   recreate <name>           Recreate container with current permissions
+  check <name>              Validate next container configuration
+  enter <name> [-- COMMAND]  Start and enter standalone container
   edit                      Edit permissions file directly
   help                      Show this help message
+
+Image profile (optional): ~/.config/distrobox-secure/containers/<name>.conf
+  user=node                 Non-root image user (otherwise inferred from image)
+  home=/home/node           Image home (otherwise inferred from HOME environment)
+  shell=/bin/sh             Interactive shell (default /bin/sh)
+
+Image user UID:GID must equal the rootless host UID:GID under keep-id.
+The image must provide /bin/sh, id and sleep. No Distrobox host integration is used.
 
 Permission Types:
 
@@ -917,6 +950,17 @@ main() {
                 exit 1
             fi
             check_container "$2"
+            ;;
+        "enter")
+            if [[ $# -lt 2 ]]; then
+                error "Container name required"
+                exit 1
+            fi
+            shift
+            local container_name="$1"
+            shift
+            [[ "${1:-}" == "--" ]] && shift
+            enter_container "$container_name" "$@"
             ;;
         "edit")
             "${EDITOR:-nano}" "$PERMISSIONS_FILE"
